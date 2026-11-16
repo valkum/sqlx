@@ -124,6 +124,21 @@ pub enum Error {
     #[error("got unexpected connection status after attempting to begin transaction")]
     BeginFailed,
 
+    /// A custom error that may be returned from a [`PoolConnector`] implementation.
+    ///
+    /// [`PoolConnector`]: crate::pool::PoolConnector
+    #[error("error returned from pool connector: {source}")]
+    PoolConnector {
+        #[source]
+        source: BoxDynError,
+
+        /// If `true`, `PoolConnector::connect()` is called again in an exponential backoff loop
+        /// up to the [acquire timeout][crate::pool::PoolOptions::acquire_timeout].
+        ///
+        /// See [`PoolConnector::connect()`][crate::pool::PoolConnector::connect] for details.
+        retryable: bool,
+    },
+
     // Not returned in normal operation.
     /// Error occurred while reading configuration file
     #[doc(hidden)]

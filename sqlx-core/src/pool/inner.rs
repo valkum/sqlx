@@ -16,6 +16,7 @@ use std::sync::{Arc, RwLock};
 use std::task::Poll;
 
 use crate::logger::private_level_filter_to_trace_level;
+use crate::pool::connect::{is_retryable_connect_error, PoolConnectMetadata};
 use crate::pool::options::PoolConnectionMetadata;
 use crate::private_tracing_dynamic_event;
 use futures_util::FutureExt;
@@ -344,6 +345,8 @@ impl<DB: Database> PoolInner<DB> {
             return Err(Error::PoolClosed);
         }
 
+        let start = Instant::now();
+        let mut num_attempts: u32 = 0;
         let mut backoff = Duration::from_millis(10);
         let max_backoff = deadline_as_timeout(deadline)? / 5;
 
@@ -358,9 +361,21 @@ impl<DB: Database> PoolInner<DB> {
                 .expect("write-lock holder panicked")
                 .clone();
 
+            let connect = match &self.options.connector {
+                Some(connector) => connector.connect(PoolConnectMetadata {
+                    start,
+                    deadline,
+                    num_attempts,
+                    pool_size: self.size(),
+                    connect_options,
+                }),
+                None => Box::pin(async move { connect_options.connect().await }),
+            };
+            num_attempts = num_attempts.saturating_add(1);
+
             // result here is `Result<Result<C, Error>, TimeoutError>`
             // if this block does not return, sleep for the backoff timeout and try again
-            match crate::rt::timeout(timeout, connect_options.connect()).await {
+            match crate::rt::timeout(timeout, connect).await {
                 // successfully established connection
                 Ok(Ok(mut raw)) => {
                     // See comment on `PoolOptions::after_connect`
@@ -387,11 +402,9 @@ impl<DB: Database> PoolInner<DB> {
                     }
                 }
 
-                // an IO error while connecting is assumed to be the system starting up
-                Ok(Err(Error::Io(e))) if e.kind() == std::io::ErrorKind::ConnectionRefused => (),
-
-                // We got a transient database error, retry.
-                Ok(Err(Error::Database(error))) if error.is_transient_in_connect_phase() => (),
+                // A refused IO connection, a transient database error,
+                // or a retryable `PoolConnector` error: retry.
+                Ok(Err(e)) if is_retryable_connect_error(&e) => (),
 
                 // Any other error while connection should immediately
                 // terminate and bubble the error up

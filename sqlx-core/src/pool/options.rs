@@ -1,8 +1,9 @@
 use crate::connection::Connection;
 use crate::database::Database;
 use crate::error::Error;
+use crate::pool::connect::BoxConnector;
 use crate::pool::inner::PoolInner;
-use crate::pool::Pool;
+use crate::pool::{Pool, PoolConnector};
 use futures_core::future::BoxFuture;
 use log::LevelFilter;
 use std::fmt::{self, Debug, Formatter};
@@ -85,6 +86,8 @@ pub struct PoolOptions<DB: Database> {
     pub(crate) fair: bool,
 
     pub(crate) parent_pool: Option<Pool<DB>>,
+
+    pub(crate) connector: Option<BoxConnector<DB>>,
 }
 
 // Manually implement `Clone` to avoid a trait bound issue.
@@ -107,6 +110,7 @@ impl<DB: Database> Clone for PoolOptions<DB> {
             idle_timeout: self.idle_timeout,
             fair: self.fair,
             parent_pool: self.parent_pool.clone(),
+            connector: self.connector.clone(),
         }
     }
 }
@@ -162,6 +166,7 @@ impl<DB: Database> PoolOptions<DB> {
             max_lifetime: Some(Duration::from_secs(30 * 60)),
             fair: true,
             parent_pool: None,
+            connector: None,
         }
     }
 
@@ -500,6 +505,24 @@ impl<DB: Database> PoolOptions<DB> {
         self
     }
 
+    /// Set a custom [`PoolConnector`] that the pool calls to open each new connection.
+    ///
+    /// By default, the pool calls [`ConnectOptions::connect()`] on its connect options.
+    /// The connector replaces that call. It gets the current connect options in
+    /// [`PoolConnectMetadata::connect_options`][crate::pool::PoolConnectMetadata::connect_options].
+    ///
+    /// The connector is called for every connection attempt, so it can fetch credentials
+    /// that expire (for example an IAM access token) when the connection is opened.
+    /// [`after_connect`][Self::after_connect] still runs on the connection that it returns.
+    ///
+    /// See [`PoolConnector`] for examples and the retry rules.
+    ///
+    /// [`ConnectOptions::connect()`]: crate::connection::ConnectOptions::connect
+    pub fn connector(mut self, connector: impl PoolConnector<DB>) -> Self {
+        self.connector = Some(Arc::new(connector));
+        self
+    }
+
     /// Set the parent `Pool` from which the new pool will inherit its semaphore.
     ///
     /// This is currently an internal-only API.
@@ -591,6 +614,7 @@ impl<DB: Database> Debug for PoolOptions<DB> {
             .field("max_lifetime", &self.max_lifetime)
             .field("idle_timeout", &self.idle_timeout)
             .field("test_before_acquire", &self.test_before_acquire)
+            .field("connector", &self.connector.is_some())
             .finish()
     }
 }

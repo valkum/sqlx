@@ -71,6 +71,7 @@ use crate::error::Error;
 use crate::sql_str::SqlSafeStr;
 use crate::transaction::Transaction;
 
+pub use self::connect::{PoolConnectMetadata, PoolConnector};
 pub use self::connection::PoolConnection;
 use self::inner::PoolInner;
 #[doc(hidden)]
@@ -83,6 +84,7 @@ mod executor;
 #[macro_use]
 pub mod maybe;
 
+mod connect;
 mod connection;
 mod inner;
 mod options;
