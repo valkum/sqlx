@@ -1,5 +1,6 @@
 use sqlx::any::{AnyConnectOptions, AnyPoolOptions};
-use sqlx::Executor;
+use sqlx::pool::PoolConnectMetadata;
+use sqlx::{Any, ConnectOptions, Executor};
 use sqlx_core::sql_str::AssertSqlSafe;
 use std::sync::{
     atomic::{AtomicI32, AtomicUsize, Ordering},
@@ -201,6 +202,146 @@ async fn test_pool_callbacks() -> anyhow::Result<()> {
     }
 
     pool.close().await;
+
+    Ok(())
+}
+
+#[sqlx_macros::test]
+async fn pool_should_invoke_connector() -> anyhow::Result<()> {
+    sqlx::any::install_default_drivers();
+    sqlx_test::setup_if_needed();
+
+    let conn_options: AnyConnectOptions = std::env::var("DATABASE_URL")?.parse()?;
+
+    let connector_calls = Arc::new(AtomicUsize::new(0));
+    let after_connect_calls = Arc::new(AtomicUsize::new(0));
+
+    let pool = AnyPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_secs(5))
+        .connector({
+            let connector_calls = connector_calls.clone();
+            move |meta: PoolConnectMetadata<Any>| {
+                let call = connector_calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    assert_eq!(meta.num_attempts as usize, call);
+
+                    // Fail the first two attempts with a retryable error.
+                    if call < 2 {
+                        return Err(sqlx::Error::PoolConnector {
+                            source: "temporary failure".into(),
+                            retryable: true,
+                        });
+                    }
+
+                    meta.connect_options.connect().await
+                }
+            }
+        })
+        .after_connect({
+            let after_connect_calls = after_connect_calls.clone();
+            move |_conn, _meta| {
+                after_connect_calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            }
+        })
+        .connect_lazy_with(conn_options);
+
+    let mut conn = pool.acquire().await?;
+    conn.execute("SELECT 1").await?;
+    drop(conn);
+
+    assert_eq!(connector_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(after_connect_calls.load(Ordering::SeqCst), 1);
+
+    pool.close().await;
+
+    Ok(())
+}
+
+#[sqlx_macros::test]
+async fn pool_should_return_non_retryable_connector_error() -> anyhow::Result<()> {
+    sqlx::any::install_default_drivers();
+    sqlx_test::setup_if_needed();
+
+    let conn_options: AnyConnectOptions = std::env::var("DATABASE_URL")?.parse()?;
+
+    let connector_calls = Arc::new(AtomicUsize::new(0));
+
+    let pool = AnyPoolOptions::new()
+        .acquire_timeout(Duration::from_secs(5))
+        .connector({
+            let connector_calls = connector_calls.clone();
+            move |_meta: PoolConnectMetadata<Any>| {
+                connector_calls.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Err(sqlx::Error::PoolConnector {
+                        source: "bad configuration".into(),
+                        retryable: false,
+                    })
+                }
+            }
+        })
+        .connect_lazy_with(conn_options);
+
+    let err = pool.acquire().await.unwrap_err();
+
+    assert!(
+        matches!(
+            err,
+            sqlx::Error::PoolConnector {
+                retryable: false,
+                ..
+            }
+        ),
+        "unexpected error: {err:?}"
+    );
+    assert_eq!(connector_calls.load(Ordering::SeqCst), 1);
+
+    Ok(())
+}
+
+#[sqlx_macros::test]
+async fn pool_connector_should_get_current_connect_options() -> anyhow::Result<()> {
+    sqlx::any::install_default_drivers();
+    sqlx_test::setup_if_needed();
+
+    let conn_options: AnyConnectOptions = std::env::var("DATABASE_URL")?.parse()?;
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+
+    let pool = AnyPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_secs(5))
+        .connector({
+            let seen = seen.clone();
+            move |meta: PoolConnectMetadata<Any>| {
+                seen.lock()
+                    .unwrap()
+                    .push(meta.connect_options.log_settings.slow_statements_duration);
+                async move { meta.connect_options.connect().await }
+            }
+        })
+        .connect_lazy_with(conn_options.clone());
+
+    pool.acquire().await?.close().await?;
+
+    // Change a setting that does not affect the connection,
+    // so the two sets of options can be told apart.
+    let mut new_options = conn_options.clone();
+    new_options.log_settings.slow_statements_duration = Duration::from_secs(123);
+    pool.set_connect_options(new_options);
+
+    pool.acquire().await?.close().await?;
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(
+        *seen,
+        [
+            conn_options.log_settings.slow_statements_duration,
+            Duration::from_secs(123)
+        ]
+    );
 
     Ok(())
 }
